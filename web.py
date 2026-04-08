@@ -446,6 +446,14 @@ TEMPLATE = """
         <label>Notify on species (comma-separated, blank = all birds)</label>
         <input type="text" name="ntfy_species" value="{{ cfg.get('ntfy_species','american crow,common raven') }}" style="background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px 10px;font-family:inherit">
       </div>
+      <div class="field">
+        <label>Local URL (for share links on local WiFi)</label>
+        <input type="text" name="local_url" value="{{ cfg.get('local_url','') }}" placeholder="http://10.0.0.9:8765" style="background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px 10px;font-family:inherit">
+      </div>
+      <div class="field">
+        <label>Tailscale URL (for remote share links + ntfy)</label>
+        <input type="text" name="tailscale_url" value="{{ cfg.get('tailscale_url','') }}" placeholder="http://mimir-1.xxx.ts.net:8765" style="background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px 10px;font-family:inherit">
+      </div>
       <button type="submit" class="primary">Save Settings</button>
     </form>
     </div>
@@ -802,6 +810,7 @@ const observer = new IntersectionObserver(entries => {
 document.querySelectorAll('.waveform-canvas').forEach(c => observer.observe(c));
 
 // ── Filter ─────────────────────────────────────────────────────
+const cfg_local_url = '{{ cfg.get("local_url", "") }}';
 let currentFilter = '{{ tag_filter }}';
 
 function setFilter(f) {
@@ -1246,7 +1255,7 @@ async function pollState() {
 pollState();
 
 function shareClip(name) {
-  const url = 'http://10.0.0.9:8765/birds';
+  const url = (cfg_local_url || window.location.origin) + '/birds';
   if (navigator.clipboard) {
     navigator.clipboard.writeText(url).then(() => {
       const msg = document.createElement('div');

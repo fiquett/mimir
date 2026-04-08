@@ -57,7 +57,8 @@ def _notify_birds(detections, wav_path, cfg):
             body = f"{int(top['confidence']*100)}% confidence"
             if others:
                 body += f" · also: {', '.join(others)}"
-            clip_url = f"http://mimir-1.tail8abb75.ts.net:8765/clip/{wav_path.name}"
+            base_url = cfg.get("tailscale_url") or cfg.get("local_url") or "http://localhost:8765"
+            clip_url = f"{base_url}/clip/{wav_path.name}"
             body += f"\n{wav_path.name}"
             payload = json.dumps({"topic": topic, "title": title, "message": body,
                                   "priority": 3, "tags": ["bird"],
