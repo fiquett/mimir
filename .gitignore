@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+config.json
+species_images.json
+recordings/
+*.wav
+*.mp4
+*.jpg

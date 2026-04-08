@@ -1,0 +1,6 @@
+flask
+numpy
+birdnetlib
+librosa
+resampy
+ai-edge-litert
