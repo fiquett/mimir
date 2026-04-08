@@ -21,5 +21,7 @@
   "camera_url": "",
   "ntfy_topic": "",
   "ntfy_species": "american crow,common raven",
-  "ui_pin": ""
+  "ui_pin": "",
+  "local_url": "",
+  "tailscale_url": ""
 }
