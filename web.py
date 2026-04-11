@@ -5,6 +5,7 @@ mimir web UI - view recordings, live level meter, adjust settings
 
 import json
 import os
+import numpy as np
 import subprocess
 import time
 from pathlib import Path
@@ -18,6 +19,34 @@ STATE_PATH = Path("/run/mimir/state.json")
 LIVE_SOCKET = Path("/run/mimir/live.sock")
 
 app = Flask(__name__)
+
+# Background CPU monitor — updates every 2s instead of blocking each request
+_cpu_cache = {"pct": 0, "temp": 0}
+def _cpu_monitor():
+    import time as _t
+    prev_idle, prev_total = 0, 0
+    while True:
+        try:
+            with open("/proc/stat") as f:
+                parts = f.readline().split()
+            vals = list(map(int, parts[1:]))
+            idle = vals[3] + vals[4]
+            total = sum(vals)
+            if prev_total:
+                dt = total - prev_total
+                di = idle - prev_idle
+                _cpu_cache["pct"] = round((1 - di / dt) * 100) if dt else 0
+            prev_idle, prev_total = idle, total
+        except Exception:
+            pass
+        try:
+            _cpu_cache["temp"] = round(float(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000, 1)
+        except Exception:
+            pass
+        _t.sleep(2)
+
+import threading as _thr
+_thr.Thread(target=_cpu_monitor, daemon=True).start()
 app.secret_key = "mimir-session-key-2026"
 
 
@@ -112,29 +141,73 @@ LABEL_ICONS = {
 }
 KNOWN_LABELS = list(LABEL_ICONS.keys())
 
+CORVIDS = {"american crow", "common raven", "northwestern crow",
+           "fish crow", "steller's jay", "blue jay", "clark's nutcracker"}
+RAPTORS = {"red-tailed hawk", "bald eagle", "cooper's hawk", "sharp-shinned hawk",
+           "peregrine falcon", "merlin", "northern harrier", "osprey"}
+OWLS = {"great horned owl", "barred owl", "short-eared owl", "northern saw-whet owl",
+        "western screech-owl", "snowy owl"}
+SOUND_TAGS = {"noise", "rain", "wind", "speech", "aircraft", "helicopter", "vehicle", "music"}
+
+
+_species_cache = {"ts": 0, "species": [], "sounds": []}
+
+def get_detected_species():
+    """Scan sidecars for all unique bird species and sound tags detected. Cached 60s."""
+    now = time.time()
+    if now - _species_cache["ts"] < 60:
+        return _species_cache["species"], _species_cache["sounds"]
+    cfg = load_config()
+    rdir = Path(cfg["recordings_dir"])
+    species = set()
+    sounds = set()
+    for sidecar in rdir.rglob("*.json"):
+        try:
+            d = json.loads(sidecar.read_text())
+            if d.get("status") != "done": continue
+            for t in d.get("tags", []):
+                label = t["label"]
+                if label in SOUND_TAGS:
+                    sounds.add(label)
+            for b in d.get("birds", []):
+                species.add(b["label"])
+        except:
+            pass
+    _species_cache["ts"] = now
+    _species_cache["species"] = sorted(species)
+    _species_cache["sounds"] = sorted(sounds)
+    return _species_cache["species"], _species_cache["sounds"]
+
+
+_bird_counts_cache = {"ts": 0, "counts": {}, "corvid": 0}
 
 def get_today_bird_counts():
-    """Return {label: count} for birds detected today, and total crow-family count."""
+    """Return {label: count} for birds detected today, and total crow-family count. Cached 30s."""
+    now = time.time()
+    if now - _bird_counts_cache["ts"] < 30:
+        return _bird_counts_cache["counts"], _bird_counts_cache["corvid"]
     from datetime import datetime
     from collections import defaultdict
     cfg = load_config()
     rdir = Path(cfg["recordings_dir"])
     today = datetime.now().strftime("%Y-%m-%d")
-    CORVIDS = {"american crow","common raven","northwestern crow",
-               "fish crow","steller's jay","blue jay","clark's nutcracker"}
+    today_dir = rdir / today
     counts = defaultdict(int)
-    for sidecar in rdir.rglob("*.json"):
-        try:
-            wav = sidecar.with_suffix(".wav")
-            if datetime.fromtimestamp(wav.stat().st_mtime).strftime("%Y-%m-%d") != today:
-                continue
-            d = json.loads(sidecar.read_text())
-            if d.get("status") != "done": continue
-            for b in d.get("birds", []):
-                counts[b["label"]] += 1
-        except Exception:
-            pass
-    corvid_total = sum(v for k, v in counts.items() if k in CORVIDS)
+    # Only scan today's directory, not all recordings
+    if today_dir.exists():
+        for sidecar in today_dir.glob("*.json"):
+            try:
+                d = json.loads(sidecar.read_text())
+                if d.get("status") != "done": continue
+                for b in d.get("birds", []):
+                    counts[b["label"]] += 1
+            except Exception:
+                pass
+    corvid_total = sum(v for k, v in counts.items()
+                       if k in CORVIDS)
+    _bird_counts_cache["ts"] = now
+    _bird_counts_cache["counts"] = dict(counts)
+    _bird_counts_cache["corvid"] = corvid_total
     return dict(counts), corvid_total
 
 def get_recordings(tag_filter=None):
@@ -174,7 +247,7 @@ def get_recordings(tag_filter=None):
             _day = _mt.strftime("%a %b %-d")
         display_time = f"{_day} {_mt.strftime('%-I:%M %p')}"
         recordings.append({
-            "path": str(wav),
+            "path": str(wav).lstrip("/"),
             "name": wav.name,
             "display_time": display_time,
             "date": wav.parent.name,
@@ -186,6 +259,7 @@ def get_recordings(tag_filter=None):
             "transcript": analysis.get("transcript", None),
             "analysis_status": analysis.get("status", None),
             "photo": analysis.get("photo", None),
+            "video": analysis.get("video", None),
             "birds": analysis.get("birds", []),
         })
 
@@ -197,9 +271,11 @@ def get_recordings(tag_filter=None):
             recordings = [r for r in recordings
                           if any(t["label"] != "noise" for t in r["tags"]) or r.get("birds")]
         elif tag_filter == "corvid":
-            CORVIDS = {"american crow", "common raven", "northwestern crow",
-                       "fish crow", "steller's jay", "blue jay", "clark's nutcracker"}
             recordings = [r for r in recordings if _all_labels(r) & CORVIDS]
+        elif tag_filter == "raptor":
+            recordings = [r for r in recordings if _all_labels(r) & RAPTORS]
+        elif tag_filter == "owl":
+            recordings = [r for r in recordings if _all_labels(r) & OWLS]
         elif tag_filter == "untagged":
             recordings = [r for r in recordings if not r["tags"] and not r.get("birds")]
         else:
@@ -275,6 +351,7 @@ TEMPLATE = """
   .bird-img-card .bird-img-label { font-size: 0.7rem; color: #3fb950; padding: 3px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .rec-photo { margin-top: 8px; }
   .rec-photo img { width: 100%; max-width: 320px; border-radius: 6px; border: 1px solid #30363d; cursor: zoom-in; transition: max-width 0.2s; }
+  .rec-photo video { max-height: 240px; }
   .rec-photo img.expanded { max-width: 100%; cursor: zoom-out; }
   .section-title { font-size: 0.75rem; text-transform: uppercase; color: #8b949e; letter-spacing: 1px; margin: 24px 0 12px; }
   .alert { background: #d2992222; border: 1px solid #d29922; border-radius: 6px; padding: 10px 14px; font-size: 0.85rem; color: #d29922; margin-bottom: 16px; }
@@ -318,7 +395,8 @@ TEMPLATE = """
   <div class="header-btns" style="display:contents">
   <button id="live-btn" onclick="toggleLive()" style="padding:3px 14px;font-size:0.8rem;border-radius:12px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;cursor:pointer">🎤 Live</button>
   <a href="/stats" style="padding:3px 14px;font-size:0.8rem;border-radius:12px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;text-decoration:none;cursor:pointer">📊 Stats</a>
-  <a href="http://10.0.0.179:8766/preview" target="_blank" style="padding:3px 14px;font-size:0.8rem;border-radius:12px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;text-decoration:none;cursor:pointer">📷 Camera</a>
+  <a href="/crows" style="padding:3px 14px;font-size:0.8rem;border-radius:12px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;text-decoration:none;cursor:pointer">🐦‍⬛ Corvids</a>
+  <a href="/camera_feed" style="padding:3px 14px;font-size:0.8rem;border-radius:12px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;text-decoration:none;cursor:pointer">📷 Camera</a>
   </div>
 </header>
 <div class="container">
@@ -533,12 +611,26 @@ TEMPLATE = """
     style="background:#161b22;border:1px solid #30363d;border-radius:8px;color:#e6edf3;padding:5px 10px;font-family:inherit;font-size:0.85rem;cursor:pointer;flex:1;max-width:260px">
     <option value="all" {% if tag_filter=='all' %}selected{% endif %}>All recordings</option>
     <option value="interesting" {% if tag_filter=='interesting' %}selected{% endif %}>★ Interesting</option>
-    <option value="corvid" {% if tag_filter=='corvid' %}selected{% endif %}>🐦‍⬛ Corvids</option>
-    {% for label in known_labels %}{% if label != 'noise' %}
-    <option value="{{ label }}" {% if tag_filter==label %}selected{% endif %}>{{ label_icons[label] }} {{ label }}</option>
-    {% endif %}{% endfor %}
-    <option value="noise" {% if tag_filter=='noise' %}selected{% endif %}>〰 noise</option>
-    <option value="untagged" {% if tag_filter=='untagged' %}selected{% endif %}>? untagged</option>
+    <option value="untagged" {% if tag_filter=='untagged' %}selected{% endif %}>? Untagged</option>
+    <optgroup label="─ Groups">
+      <option value="corvid" {% if tag_filter=='corvid' %}selected{% endif %}>🐦‍⬛ Corvids</option>
+      <option value="raptor" {% if tag_filter=='raptor' %}selected{% endif %}>🦅 Raptors</option>
+      <option value="owl" {% if tag_filter=='owl' %}selected{% endif %}>🦉 Owls</option>
+    </optgroup>
+    {% if detected_species %}
+    <optgroup label="─ Species detected">
+      {% for sp in detected_species %}
+      <option value="{{ sp }}" {% if tag_filter==sp %}selected{% endif %}>{{ label_icons.get(sp, '🐦') }} {{ sp }}</option>
+      {% endfor %}
+    </optgroup>
+    {% endif %}
+    {% if detected_sounds %}
+    <optgroup label="─ Sound types">
+      {% for s in detected_sounds %}
+      <option value="{{ s }}" {% if tag_filter==s %}selected{% endif %}>{{ label_icons.get(s, '🔊') }} {{ s }}</option>
+      {% endfor %}
+    </optgroup>
+    {% endif %}
   </select>
 </div>
 <div id="pagination-top"></div>
@@ -578,7 +670,7 @@ TEMPLATE = """
     {% if rec.birds %}
     <div class="rec-birds">
       {% for b in rec.birds %}
-      {% if b.start is defined %}<span class="bird-det" style="cursor:pointer" onclick="seekAndPlay(this, {{ b.start }})" title="Jump to {{ b.start }}s">{{ b.icon }} <strong>{{ b.label }}</strong> <span class="tag-conf">{{ (b.confidence*100)|int }}%</span> <span style="color:#8b949e;font-size:0.7rem">▶ {{ b.start }}–{{ b.end }}s</span></span>{% else %}<span class="bird-det">{{ b.icon }} <strong>{{ b.label }}</strong> <span class="tag-conf">{{ (b.confidence*100)|int }}%</span></span>{% endif %} <button onclick="confirmBird(event,'{{ rec.path | e }}','{{ b.label | e }}',true)" style="background:#23863622;border:1px solid #238636;border-radius:4px;color:#3fb950;font-size:0.7rem;padding:1px 5px;cursor:pointer" title="Confirm">✓</button><button onclick="confirmBird(event,'{{ rec.path | e }}','{{ b.label | e }}',false)" style="background:#da363311;border:1px solid #da3633;border-radius:4px;color:#f85149;font-size:0.7rem;padding:1px 5px;cursor:pointer;margin-left:2px" title="Wrong">✗</button>
+      {% if b.start is defined %}<span class="bird-det" style="cursor:pointer" onclick="seekAndPlay(this, {{ b.start }})" title="Jump to {{ b.start }}s">{{ b.icon }} <strong>{{ b.label }}</strong> <span class="tag-conf">{{ (b.confidence*100)|int }}%</span> <span style="color:#8b949e;font-size:0.7rem">▶ {{ b.start }}–{{ b.end }}s</span></span>{% else %}<span class="bird-det">{{ b.icon }} <strong>{{ b.label }}</strong> <span class="tag-conf">{{ (b.confidence*100)|int }}%</span></span>{% endif %}{% if b.crow_name is defined %} <span style="font-size:0.72rem;background:#1a1a2e;border:1px solid #6f42c1;border-radius:8px;padding:1px 7px;color:#d2a8ff">{{ b.crow_name }}{% if b.is_new_crow %} ✨{% endif %} <span style="color:#8b949e">#{{ b.crow_sightings }}</span></span>{% endif %} <button onclick="confirmBird(event,'{{ rec.path | e }}','{{ b.label | e }}',true)" style="background:#23863622;border:1px solid #238636;border-radius:4px;color:#3fb950;font-size:0.7rem;padding:1px 5px;cursor:pointer" title="Confirm">✓</button><button onclick="confirmBird(event,'{{ rec.path | e }}','{{ b.label | e }}',false)" style="background:#da363311;border:1px solid #da3633;border-radius:4px;color:#f85149;font-size:0.7rem;padding:1px 5px;cursor:pointer;margin-left:2px" title="Wrong">✗</button>
       {% endfor %}
     </div>
     {% set birds_with_images = rec.birds | selectattr('image_url', 'defined') | list %}
@@ -596,7 +688,12 @@ TEMPLATE = """
     {% if rec.transcript and rec.transcript.text %}
     <div class="rec-transcript">{{ rec.transcript.text }}</div>
     {% endif %}
-    {% if rec.photo %}
+    {% if rec.video %}
+    <div class="rec-photo">
+      <video src="/api/camera/photo/{{ rec.video }}" controls preload="none" poster="{% if rec.photo %}/api/camera/photo/{{ rec.photo }}{% endif %}"
+             style="width:100%;max-width:400px;border-radius:6px;border:1px solid #30363d"></video>
+    </div>
+    {% elif rec.photo %}
     <div class="rec-photo">
       <img src="/api/camera/photo/{{ rec.photo }}" alt="captured" loading="lazy"
            onclick="this.classList.toggle('expanded')" title="Click to expand">
@@ -604,7 +701,8 @@ TEMPLATE = """
     {% endif %}
     <audio src="/audio/{{ rec.path | urlencode }}" preload="none"></audio>
   </div>
-  <button onclick="shareClip('{{ rec.name | e }}')" style="margin-left:4px;padding:4px 8px;font-size:0.8rem;color:#8b949e;border:1px solid #30363d;background:#21262d;border-radius:6px;cursor:pointer;flex-shrink:0" title="Copy link">&#x1F517;</button>
+  <button onclick="shareLAN('{{ rec.name | e }}')" style="margin-left:4px;padding:4px 6px;font-size:0.7rem;color:#3fb950;border:1px solid #238636;background:#23863611;border-radius:6px;cursor:pointer;flex-shrink:0" title="Copy LAN link (friends)">&#x1F517; LAN</button>
+  <button onclick="shareTS('{{ rec.name | e }}')" style="margin-left:2px;padding:4px 6px;font-size:0.7rem;color:#58a6ff;border:1px solid #1f6feb;background:#1f6feb11;border-radius:6px;cursor:pointer;flex-shrink:0" title="Copy Tailscale link">&#x1F517; TS</button>
   <button onclick="deleteRec(this, '{{ rec.path | e }}')" style="margin-left:4px;padding:4px 8px;font-size:0.8rem;color:#f85149;border:1px solid #da3633;background:#da363311;border-radius:6px;cursor:pointer;flex-shrink:0" title="Delete">&#x2715;</button>
 </div>
 {% else %}
@@ -618,9 +716,11 @@ TEMPLATE = """
 <script>
 // ── Waveform rendering ──────────────────────────────────────────
 function drawWaveform(canvas, peaks, progress) {
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.offsetWidth, h = canvas.offsetHeight;
-  canvas.width = w * dpr; canvas.height = h * dpr;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width === 0) { requestAnimationFrame(() => drawWaveform(canvas, peaks, progress)); return; }
+  const dpr = window.devicePixelRatio || 2;
+  const w = rect.width, h = rect.height;
+  canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
   const ctx = canvas.getContext('2d');
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, w, h);
@@ -642,8 +742,8 @@ function drawWaveform(canvas, peaks, progress) {
 async function loadWaveform(canvas) {
   if (canvas._peaks) return canvas._peaks;
   // Wait for layout so canvas has real dimensions
-  if (canvas.offsetWidth === 0) {
-    await new Promise(r => setTimeout(r, 100));
+  if (canvas.getBoundingClientRect().width === 0) {
+    await new Promise(r => setTimeout(r, 200));
   }
   const path = canvas.dataset.audiopath.replace('/audio/', '');
   const res = await fetch('/api/waveform/' + path);
@@ -663,7 +763,7 @@ function startPlayheadTick(audio, canvas, peaks, btn, timeEl, playhead) {
     if (!audio.paused) {
       const progress = audio.currentTime / (audio.duration || 1);
       drawWaveform(canvas, peaks, progress);
-      playhead.style.left = (progress * canvas.offsetWidth) + 'px';
+      playhead.style.left = (progress * canvas.getBoundingClientRect().width) + 'px';
       timeEl.textContent = formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration || 0);
       requestAnimationFrame(tick);
     }
@@ -767,7 +867,7 @@ function seekAudio(e) {
   function doSeek() {
     audio.currentTime = seekFraction * audio.duration;
     drawWaveform(canvas, peaks, seekFraction);
-    item.querySelector('.playhead').style.left = (seekFraction * canvas.offsetWidth) + 'px';
+    item.querySelector('.playhead').style.left = (seekFraction * canvas.getBoundingClientRect().width) + 'px';
     item.querySelector('.playhead').style.opacity = '1';
     item.querySelector('.time-display').textContent =
       formatTime(audio.currentTime) + ' / ' + formatTime(audio.duration);
@@ -811,6 +911,7 @@ document.querySelectorAll('.waveform-canvas').forEach(c => observer.observe(c));
 
 // ── Filter ─────────────────────────────────────────────────────
 const cfg_local_url = '{{ cfg.get("local_url", "") }}';
+const cfg_tailscale_url = '{{ cfg.get("tailscale_url", "") }}';
 let currentFilter = '{{ tag_filter }}';
 
 function setFilter(f) {
@@ -1250,23 +1351,44 @@ async function pollState() {
       lastQueueBusy = false;
     }
   } catch(e) {}
-  setTimeout(pollState, 150);
+  setTimeout(pollState, 1000);
 }
 pollState();
 
-function shareClip(name) {
-  const url = (cfg_local_url || window.location.origin) + '/birds';
-  if (navigator.clipboard) {
-    navigator.clipboard.writeText(url).then(() => {
-      const msg = document.createElement('div');
-      msg.textContent = 'Link copied!';
-      msg.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#238636;color:white;padding:8px 18px;border-radius:8px;font-size:0.85rem;z-index:9999';
-      document.body.appendChild(msg);
-      setTimeout(() => msg.remove(), 2000);
-    });
-  } else {
-    prompt('Copy clip link:', window.location.origin + '/clip/' + encodeURIComponent(name));
+function _copyAndToast(url, label) {
+  function _toast(text, color) {
+    const msg = document.createElement('div');
+    msg.textContent = text;
+    msg.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:'+color+';color:white;padding:8px 18px;border-radius:8px;font-size:0.85rem;z-index:9999';
+    document.body.appendChild(msg);
+    setTimeout(() => msg.remove(), 3000);
   }
+  // Try clipboard API first, then execCommand fallback, then prompt
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(url).then(() => _toast(label + ' link copied!', '#238636'));
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = url;
+    ta.style.cssText = 'position:fixed;left:-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+      _toast(label + ' link copied!', '#238636');
+    } catch(e) {
+      _toast('Copy this link:', '#d29922');
+      prompt('Copy link:', url);
+    }
+    ta.remove();
+  }
+}
+function shareLAN(name) {
+  const base = cfg_local_url || window.location.origin;
+  _copyAndToast(base + '/birds/clip/' + encodeURIComponent(name), 'LAN');
+}
+function shareTS(name) {
+  const base = cfg_tailscale_url || window.location.origin;
+  _copyAndToast(base + '/clip/' + encodeURIComponent(name), 'Tailscale');
 }
 
 async function confirmBird(evt, path, label, correct) {
@@ -1345,36 +1467,18 @@ def index():
                                   known_labels=KNOWN_LABELS,
                                   label_icons=LABEL_ICONS,
                                   bird_counts=bird_counts,
-                                  corvid_total=corvid_total)
+                                  corvid_total=corvid_total,
+                                  detected_species=get_detected_species()[0],
+                                  detected_sounds=get_detected_species()[1])
 
 
 @app.route("/api/state")
 @require_auth
 def api_state():
     state = load_state()
-    # Add CPU% via /proc/stat (two samples 200ms apart)
-    try:
-        import time as _time
-        def _read_cpu():
-            with open("/proc/stat") as f:
-                parts = f.readline().split()
-            vals = list(map(int, parts[1:]))
-            idle = vals[3] + vals[4]  # idle + iowait
-            total = sum(vals)
-            return idle, total
-        i1, t1 = _read_cpu()
-        _time.sleep(0.2)
-        i2, t2 = _read_cpu()
-        dt = t2 - t1
-        state["cpu_pct"] = round((1 - (i2 - i1) / dt) * 100) if dt else 0
-    except Exception:
-        state["cpu_pct"] = None
-    # Add CPU temp
-    try:
-        temp = float(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000
-        state["cpu_temp"] = round(temp, 1)
-    except Exception:
-        state["cpu_temp"] = None
+    # CPU% from background cache (updated every 2s, no blocking)
+    state["cpu_pct"] = _cpu_cache.get("pct")
+    state["cpu_temp"] = _cpu_cache.get("temp")
     return jsonify(state)
 
 
@@ -1421,7 +1525,7 @@ RECORDING_ITEM_TEMPLATE = """
     {% if rec.birds %}
     <div class="rec-birds">
       {% for b in rec.birds %}
-      {% if b.start is defined %}<span class="bird-det" style="cursor:pointer" onclick="seekAndPlay(this, {{ b.start }})" title="Jump to {{ b.start }}s">{{ b.icon }} <strong>{{ b.label }}</strong> <span class="tag-conf">{{ (b.confidence*100)|int }}%</span> <span style="color:#8b949e;font-size:0.7rem">▶ {{ b.start }}–{{ b.end }}s</span></span>{% else %}<span class="bird-det">{{ b.icon }} <strong>{{ b.label }}</strong> <span class="tag-conf">{{ (b.confidence*100)|int }}%</span></span>{% endif %} <button onclick="confirmBird(event,'{{ rec.path | e }}','{{ b.label | e }}',true)" style="background:#23863622;border:1px solid #238636;border-radius:4px;color:#3fb950;font-size:0.7rem;padding:1px 5px;cursor:pointer" title="Confirm">✓</button><button onclick="confirmBird(event,'{{ rec.path | e }}','{{ b.label | e }}',false)" style="background:#da363311;border:1px solid #da3633;border-radius:4px;color:#f85149;font-size:0.7rem;padding:1px 5px;cursor:pointer;margin-left:2px" title="Wrong">✗</button>
+      {% if b.start is defined %}<span class="bird-det" style="cursor:pointer" onclick="seekAndPlay(this, {{ b.start }})" title="Jump to {{ b.start }}s">{{ b.icon }} <strong>{{ b.label }}</strong> <span class="tag-conf">{{ (b.confidence*100)|int }}%</span> <span style="color:#8b949e;font-size:0.7rem">▶ {{ b.start }}–{{ b.end }}s</span></span>{% else %}<span class="bird-det">{{ b.icon }} <strong>{{ b.label }}</strong> <span class="tag-conf">{{ (b.confidence*100)|int }}%</span></span>{% endif %}{% if b.crow_name is defined %} <span style="font-size:0.72rem;background:#1a1a2e;border:1px solid #6f42c1;border-radius:8px;padding:1px 7px;color:#d2a8ff">{{ b.crow_name }}{% if b.is_new_crow %} ✨{% endif %} <span style="color:#8b949e">#{{ b.crow_sightings }}</span></span>{% endif %} <button onclick="confirmBird(event,'{{ rec.path | e }}','{{ b.label | e }}',true)" style="background:#23863622;border:1px solid #238636;border-radius:4px;color:#3fb950;font-size:0.7rem;padding:1px 5px;cursor:pointer" title="Confirm">✓</button><button onclick="confirmBird(event,'{{ rec.path | e }}','{{ b.label | e }}',false)" style="background:#da363311;border:1px solid #da3633;border-radius:4px;color:#f85149;font-size:0.7rem;padding:1px 5px;cursor:pointer;margin-left:2px" title="Wrong">✗</button>
       {% endfor %}
     </div>
     {% set birds_with_images = rec.birds | selectattr('image_url', 'defined') | list %}
@@ -1439,7 +1543,12 @@ RECORDING_ITEM_TEMPLATE = """
     {% if rec.transcript and rec.transcript.text %}
     <div class="rec-transcript">{{ rec.transcript.text }}</div>
     {% endif %}
-    {% if rec.photo %}
+    {% if rec.video %}
+    <div class="rec-photo">
+      <video src="/api/camera/photo/{{ rec.video }}" controls preload="none" poster="{% if rec.photo %}/api/camera/photo/{{ rec.photo }}{% endif %}"
+             style="width:100%;max-width:400px;border-radius:6px;border:1px solid #30363d"></video>
+    </div>
+    {% elif rec.photo %}
     <div class="rec-photo">
       <img src="/api/camera/photo/{{ rec.photo }}" alt="captured" loading="lazy"
            onclick="this.classList.toggle('expanded')" title="Click to expand">
@@ -1447,7 +1556,8 @@ RECORDING_ITEM_TEMPLATE = """
     {% endif %}
     <audio src="/audio/{{ rec.path | urlencode }}" preload="none"></audio>
   </div>
-  <button onclick="shareClip('{{ rec.name | e }}')" style="margin-left:4px;padding:4px 8px;font-size:0.8rem;color:#8b949e;border:1px solid #30363d;background:#21262d;border-radius:6px;cursor:pointer;flex-shrink:0" title="Copy link">&#x1F517;</button>
+  <button onclick="shareLAN('{{ rec.name | e }}')" style="margin-left:4px;padding:4px 6px;font-size:0.7rem;color:#3fb950;border:1px solid #238636;background:#23863611;border-radius:6px;cursor:pointer;flex-shrink:0" title="Copy LAN link (friends)">&#x1F517; LAN</button>
+  <button onclick="shareTS('{{ rec.name | e }}')" style="margin-left:2px;padding:4px 6px;font-size:0.7rem;color:#58a6ff;border:1px solid #1f6feb;background:#1f6feb11;border-radius:6px;cursor:pointer;flex-shrink:0" title="Copy Tailscale link">&#x1F517; TS</button>
   <button onclick="deleteRec(this, '{{ rec.path | e }}')" style="margin-left:4px;padding:4px 8px;font-size:0.8rem;color:#f85149;border:1px solid #da3633;background:#da363311;border-radius:6px;cursor:pointer;flex-shrink:0" title="Delete">&#x2715;</button>
 </div>
 """
@@ -1586,7 +1696,10 @@ async function loadWaveform(canvas){
 }
 function drawWaveform(canvas,peaks,progress){
   if(!peaks||!peaks.length)return;
-  const ctx=canvas.getContext('2d');const w=canvas.width=canvas.offsetWidth*2;const h=canvas.height=canvas.offsetHeight*2;
+  const rect=canvas.getBoundingClientRect();
+  if(rect.width===0){requestAnimationFrame(()=>drawWaveform(canvas,peaks,progress));return}
+  const dpr=window.devicePixelRatio||2;
+  const ctx=canvas.getContext('2d');const w=canvas.width=Math.round(rect.width*dpr);const h=canvas.height=Math.round(rect.height*dpr);
   ctx.clearRect(0,0,w,h);const barW=Math.max(1,w/peaks.length);const mid=h/2;
   for(let i=0;i<peaks.length;i++){const amp=peaks[i]*mid*0.9;ctx.fillStyle=(i/peaks.length<progress)?'#58a6ff':'#30363d';ctx.fillRect(i*barW,mid-amp,barW-1,amp*2||1)}
 }
@@ -1714,7 +1827,7 @@ def public_bird_feed():
             except Exception:
                 duration = "\u2014"
             bird_recs.append({
-                "path": str(wav), "display_time": display_time,
+                "path": str(wav).lstrip("/"), "display_time": display_time,
                 "duration": duration, "birds": birds,
             })
             if mt.strftime("%Y-%m-%d") == today:
@@ -1775,7 +1888,7 @@ def api_birds_feed():
                     duration = f"{int(secs//60)}:{int(secs%60):02d}"
             except Exception:
                 duration = "\u2014"
-            bird_recs.append({"path": str(wav), "display_time": display_time,
+            bird_recs.append({"path": str(wav).lstrip("/"), "display_time": display_time,
                               "duration": duration, "birds": birds})
             if mt.strftime("%Y-%m-%d") == today:
                 for b in birds:
@@ -1922,9 +2035,16 @@ async function loadWaveform() {
 }
 function drawWaveform(progress) {
   if (!peaks || !peaks.length) return;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width === 0) {
+    // Canvas not laid out yet, retry
+    requestAnimationFrame(() => drawWaveform(progress));
+    return;
+  }
   const ctx = canvas.getContext('2d');
-  const w = canvas.width = canvas.offsetWidth * 2;
-  const h = canvas.height = canvas.offsetHeight * 2;
+  const dpr = window.devicePixelRatio || 2;
+  const w = canvas.width = Math.round(rect.width * dpr);
+  const h = canvas.height = Math.round(rect.height * dpr);
   ctx.clearRect(0,0,w,h);
   const barW = Math.max(1, w/peaks.length);
   const mid = h/2;
@@ -1968,11 +2088,55 @@ function seekAudio(e) {
   });
 }
 audio.addEventListener('ended',()=>{ playBtn.textContent='\u25B6'; playhead.style.opacity='0'; if(peaks)drawWaveform(1); });
-loadWaveform();
+requestAnimationFrame(() => loadWaveform());
 </script>
 </body>
 </html>
 """
+
+@app.route("/birds/clip/<path:name>")
+def public_clip_page(name):
+    """Public clip page — only serves clips with bird detections and no speech."""
+    cfg = load_config()
+    rdir = Path(cfg["recordings_dir"])
+    wav = next(rdir.rglob(name), None)
+    if not wav:
+        abort(404)
+    sidecar = wav.with_suffix(".json")
+    analysis = {}
+    if sidecar.exists():
+        try: analysis = json.loads(sidecar.read_text())
+        except: pass
+    birds = analysis.get("birds", [])
+    tags = {t["label"] for t in analysis.get("tags", [])}
+    # Block non-bird clips and clips with speech
+    if not birds or "speech" in tags:
+        abort(403)
+    # Reuse the authenticated clip page template
+    from datetime import datetime
+    import wave as wavelib
+    mt = datetime.fromtimestamp(wav.stat().st_mtime)
+    safe_tags = [t for t in analysis.get("tags", []) if t.get("source") != "birdnet"]
+    try:
+        with wavelib.open(str(wav), "r") as wf:
+            secs = wf.getnframes() / wf.getframerate()
+            duration = f"{int(secs//60)}:{int(secs%60):02d}"
+    except Exception:
+        duration = "\u2014"
+    now = datetime.now()
+    if mt.date() == now.date():
+        day = "Today"
+    elif (now.date() - mt.date()).days == 1:
+        day = "Yesterday"
+    else:
+        day = mt.strftime("%a %b %-d")
+    display_time = f"{day} {mt.strftime('%-I:%M %p')}"
+    return render_template_string(CLIP_PAGE_TEMPLATE,
+        name=name, wav_path=str(wav).lstrip("/"), display_time=display_time,
+        duration=duration, birds=birds, tags=safe_tags,
+        photo=analysis.get("photo"), video=analysis.get("video"))
+
+
 @app.route("/clip/<path:name>")
 @require_auth
 def clip_page(name):
@@ -2007,7 +2171,7 @@ def clip_page(name):
         day = mt.strftime("%a %b %-d")
     display_time = f"{day} {mt.strftime('%-I:%M %p')}"
     return render_template_string(CLIP_PAGE_TEMPLATE,
-        name=name, wav_path=str(wav), display_time=display_time,
+        name=name, wav_path=str(wav).lstrip("/"), display_time=display_time,
         duration=duration, birds=birds, tags=tags,
         photo=analysis.get("photo"), video=analysis.get("video"))
 
@@ -2161,19 +2325,601 @@ def audio(filepath):
 
 @app.route("/api/camera/photo/<path:fname>")
 def camera_photo(fname):
-    """Proxy a photo from the uplink camera server."""
-    import urllib.request as _ur
-    cfg = load_config()
-    camera_url = cfg.get("camera_url", "").rstrip("/")
-    if not camera_url:
+    """Serve a camera clip thumbnail or video from local storage."""
+    # Check /mnt/usb/camera/ tree
+    camera_dir = Path("/mnt/usb/camera")
+    # fname could be full path or just filename
+    p = Path(fname)
+    if p.exists():
+        fpath = p
+    else:
+        fpath = next(camera_dir.rglob(p.name), None) if p.name else None
+        if not fpath:
+            fpath = camera_dir / fname
+    if not fpath or not fpath.exists():
         abort(404)
-    try:
-        with _ur.urlopen(f"{camera_url}/photos/{fname}", timeout=5) as r:
-            data = r.read()
-        return Response(data, mimetype="image/jpeg")
-    except Exception:
-        abort(404)
+    mime = "video/mp4" if fpath.suffix == ".mp4" else "image/jpeg"
+    return send_file(str(fpath), mimetype=mime)
 
+
+@app.route("/api/camera/clips")
+@require_auth
+def camera_clips():
+    """Return recent camera clips as JSON."""
+    camera_dir = Path("/mnt/usb/camera")
+    clips = []
+    for mp4 in sorted(camera_dir.rglob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)[:50]:
+        thumb = mp4.with_name(mp4.stem + "_thumb.jpg")
+        sidecar = mp4.with_suffix(".json")
+        meta = {}
+        if sidecar.exists():
+            try: meta = json.loads(sidecar.read_text())
+            except: pass
+        from datetime import datetime
+        mt = datetime.fromtimestamp(mp4.stat().st_mtime)
+        now = datetime.now()
+        if mt.date() == now.date():
+            day = "Today"
+        elif (now.date() - mt.date()).days == 1:
+            day = "Yesterday"
+        else:
+            day = mt.strftime("%a %b %-d")
+        vision = meta.get("vision_id", {})
+        clips.append({
+            "path": str(mp4),
+            "name": mp4.name,
+            "display_time": f"{day} {mt.strftime('%-I:%M %p')}",
+            "thumb": str(thumb) if thumb.exists() else None,
+            "label": meta.get("label", "motion"),
+            "confidence": meta.get("confidence", 0),
+            "size_kb": round(mp4.stat().st_size / 1024, 1),
+            "vision_species": vision.get("species", ""),
+            "vision_confidence": vision.get("confidence", ""),
+            "vision_desc": vision.get("description", ""),
+        })
+    return jsonify(clips)
+
+
+
+CAMERA_FEED_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mimir — camera feed</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', monospace; background: #0d1117; color: #c9d1d9; min-height: 100vh; }
+  .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+  h1 { color: #58a6ff; font-size: 1.1rem; margin-bottom: 4px; }
+  .subtitle { color: #8b949e; font-size: 0.8rem; margin-bottom: 20px; }
+  a.back { color: #8b949e; font-size: 0.85rem; text-decoration: none; }
+  a.back:hover { color: #58a6ff; }
+  .clips-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+  .clip-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+  .clip-card video { width: 100%; display: block; background: #0a0e14; }
+  .clip-card img.thumb { width: 100%; display: block; cursor: pointer; background: #0a0e14; }
+  .clip-info { padding: 10px; }
+  .clip-time { font-size: 0.85rem; color: #e6edf3; font-weight: 600; }
+  .clip-label { display: inline-block; font-size: 0.75rem; background: #0d1f0d; border: 1px solid #238636; border-radius: 8px; padding: 1px 8px; color: #3fb950; margin-top: 4px; }
+  .clip-label.person { background: #1f6feb22; border-color: #1f6feb; color: #58a6ff; }
+  .clip-label.motion { background: #21262d; border-color: #30363d; color: #8b949e; }
+  .clip-meta { font-size: 0.72rem; color: #8b949e; margin-top: 4px; }
+  .none { color: #8b949e; font-size: 0.85rem; padding: 24px 0; }
+  .snapshot { margin-bottom: 16px; }
+  .snapshot img { width: 100%; max-width: 640px; border-radius: 8px; border: 1px solid #30363d; }
+</style>
+</head>
+<body>
+<div class="container">
+  <a class="back" href="/">&#8592; mimir</a>
+  <h1>camera feed</h1>
+  <div class="subtitle">Motion and AI detections from Reolink · <a href="/api/camera/snapshot" target="_blank" style="color:#58a6ff;text-decoration:none">Live snapshot</a></div>
+
+  {% if clips %}
+  <div class="clips-grid">
+    {% for c in clips %}
+    <div class="clip-card">
+      {% if c.thumb %}
+      <img class="thumb" src="/api/camera/photo/{{ c.thumb }}" alt="{{ c.label }}"
+           onclick="this.style.display='none';this.nextElementSibling.style.display='block';this.nextElementSibling.play()">
+      <video src="/api/camera/photo/{{ c.path }}" controls preload="none" style="display:none"></video>
+      {% else %}
+      <video src="/api/camera/photo/{{ c.path }}" controls preload="metadata"></video>
+      {% endif %}
+      <div class="clip-info">
+        <div class="clip-time">{{ c.display_time }}</div>
+        <span class="clip-label {% if 'person' in c.label %}person{% elif 'motion' in c.label %}motion{% endif %}">
+          {% if 'animal' in c.label %}&#x1F426;{% elif 'person' in c.label %}&#x1F464;{% else %}&#x25CE;{% endif %}
+          {{ c.label }} {{ (c.confidence * 100)|int }}%
+        </span>
+        {% if c.vision_species %}
+        <span class="clip-label" style="background:#1a1a2e;border-color:#6f42c1;color:#d2a8ff">
+          &#x1F441; {{ c.vision_species }} ({{ c.vision_confidence }})
+        </span>
+        {% if c.vision_desc %}<div style="font-size:0.7rem;color:#8b949e;margin-top:2px">{{ c.vision_desc }}</div>{% endif %}
+        {% endif %}
+        <div class="clip-meta">{{ c.size_kb }} KB
+          <button onclick="deleteClip(this, '{{ c.path }}')" style="margin-left:8px;padding:1px 6px;font-size:0.7rem;color:#f85149;border:1px solid #da3633;background:#da363311;border-radius:4px;cursor:pointer" title="Delete">&#x2715;</button>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="none">No camera clips yet.</div>
+  {% endif %}
+</div>
+<script>
+async function deleteClip(btn, path) {
+  const card = btn.closest('.clip-card');
+  btn.disabled = true;
+  btn.textContent = '...';
+  const r = await fetch('/api/camera/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path})
+  });
+  if (r.ok) {
+    card.style.transition = 'opacity 0.3s';
+    card.style.opacity = '0';
+    setTimeout(() => card.remove(), 300);
+  } else {
+    btn.disabled = false;
+    btn.textContent = '\u2715';
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+
+
+
+@app.route("/api/camera/delete", methods=["POST"])
+@require_auth
+def delete_camera_clip():
+    data = request.get_json(silent=True) or {}
+    path = data.get("path", "")
+    if not path:
+        return jsonify({"error": "no path"}), 400
+    p = Path(path)
+    camera_dir = Path("/mnt/usb/camera")
+    if not str(p).startswith(str(camera_dir)):
+        return jsonify({"error": "invalid path"}), 403
+    deleted = []
+    for ext in [".mp4", ".json", "_thumb.jpg"]:
+        f = p.with_suffix(ext) if ext != "_thumb.jpg" else p.with_name(p.stem + "_thumb.jpg")
+        if f.exists():
+            f.unlink()
+            deleted.append(f.name)
+    # Also clean crop file
+    crop = p.with_name(p.stem + "_crop.jpg")
+    if crop.exists():
+        crop.unlink()
+        deleted.append(crop.name)
+    # Remove references from audio sidecars pointing to this clip
+    rdir = Path(load_config().get("recordings_dir", "/mnt/usb"))
+    clip_str = str(p)
+    thumb_str = str(p.with_name(p.stem + "_thumb.jpg"))
+    for sc in rdir.rglob("*.json"):
+        try:
+            d = json.loads(sc.read_text())
+            changed = False
+            if d.get("video") and str(d["video"]) == clip_str:
+                del d["video"]
+                changed = True
+            if d.get("photo") and str(d["photo"]) == thumb_str:
+                del d["photo"]
+                changed = True
+            if changed:
+                sc.write_text(json.dumps(d, indent=2))
+        except Exception:
+            pass
+    # Clean empty day dirs
+    try:
+        p.parent.rmdir()
+    except OSError:
+        pass
+    return jsonify({"deleted": deleted})
+
+
+
+@app.route("/crows")
+@require_auth
+def crows_page():
+    import sys
+    sys.path.insert(0, "/home/pi/mimir")
+    from crow_id import get_all_crows, get_crow_sightings
+    from datetime import datetime
+    from collections import defaultdict
+
+    crows = get_all_crows()
+    cfg = load_config()
+    rdir = Path(cfg["recordings_dir"])
+
+    for c in crows:
+        c["sightings"] = get_crow_sightings(c["id"], limit=100)
+
+        # Format dates
+        for field in ["first_seen", "last_seen"]:
+            if c.get(field):
+                try:
+                    dt = datetime.fromisoformat(c[field])
+                    now = datetime.now()
+                    if dt.date() == now.date():
+                        c[field + "_display"] = f"Today {dt.strftime('%-I:%M %p')}"
+                    elif (now.date() - dt.date()).days == 1:
+                        c[field + "_display"] = f"Yesterday {dt.strftime('%-I:%M %p')}"
+                    else:
+                        c[field + "_display"] = dt.strftime("%b %-d, %-I:%M %p")
+                except:
+                    c[field + "_display"] = c[field][:16]
+            else:
+                c[field + "_display"] = "\u2014"
+
+        # Hourly heatmap from sightings
+        hourly = [0] * 24
+        daily_counts = defaultdict(int)
+        for s in c["sightings"]:
+            try:
+                dt = datetime.fromisoformat(s["timestamp"])
+                hourly[dt.hour] += 1
+                daily_counts[dt.strftime("%Y-%m-%d")] += 1
+            except:
+                pass
+        max_h = max(hourly) or 1
+        c["hourly"] = [{"hour": h, "count": hourly[h],
+                        "label": f"{h%12 or 12}{'am' if h<12 else 'pm'}",
+                        "alpha": round(0.15 + 0.85 * hourly[h] / max_h, 2) if hourly[h] else 0}
+                       for h in range(24)]
+        c["days_active"] = len(daily_counts)
+        c["avg_per_day"] = round(sum(daily_counts.values()) / max(len(daily_counts), 1), 1)
+
+        # Find latest camera clip that has a confirmed crow/corvid in its sidecar
+        c["photo"] = None
+        camera_dir = Path("/mnt/usb/camera")
+        if camera_dir.exists():
+            for clip_json in sorted(camera_dir.rglob("*.json"),
+                                     key=lambda f: f.stat().st_mtime, reverse=True):
+                try:
+                    meta = json.loads(clip_json.read_text())
+                    label = meta.get("label", "")
+                    vision = meta.get("vision_id", {})
+                    vision_species = (vision.get("species", "") or "").lower()
+                    # Match if label or vision ID contains a corvid reference
+                    corvid_words = {"crow", "raven", "jay", "magpie", "corvid"}
+                    if any(w in label.lower() for w in corvid_words) or \
+                       any(w in vision_species for w in corvid_words):
+                        thumb = clip_json.with_name(clip_json.stem + "_thumb.jpg")
+                        if thumb.exists():
+                            c["photo"] = str(thumb)
+                            break
+                except:
+                    pass
+
+        # Format sightings for display
+        for s in c["sightings"]:
+            try:
+                dt = datetime.fromisoformat(s["timestamp"])
+                now = datetime.now()
+                if dt.date() == now.date():
+                    s["display_time"] = f"Today {dt.strftime('%-I:%M %p')}"
+                elif (now.date() - dt.date()).days == 1:
+                    s["display_time"] = f"Yesterday {dt.strftime('%-I:%M %p')}"
+                else:
+                    s["display_time"] = dt.strftime("%b %-d %-I:%M %p")
+            except:
+                s["display_time"] = s["timestamp"][:16]
+
+    return render_template_string(CROWS_TEMPLATE, crows=crows)
+
+
+CROWS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mimir \u2014 known corvids</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', monospace; background: #0d1117; color: #c9d1d9; min-height: 100vh; }
+  .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+  h1 { color: #58a6ff; font-size: 1.1rem; margin-bottom: 16px; }
+  a.back { color: #8b949e; font-size: 0.85rem; text-decoration: none; }
+  a.back:hover { color: #58a6ff; }
+
+  .corvid-card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 16px; overflow: hidden; }
+  .corvid-header { display: flex; gap: 16px; padding: 16px; align-items: flex-start; }
+  .corvid-photo { width: 120px; height: 90px; border-radius: 8px; object-fit: cover; border: 1px solid #30363d; background: #0d1117; flex-shrink: 0; }
+  .corvid-photo-placeholder { width: 120px; height: 90px; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; display: flex; align-items: center; justify-content: center; font-size: 2.5rem; flex-shrink: 0; }
+  .corvid-info { flex: 1; min-width: 0; }
+  .corvid-name { font-size: 1.1rem; font-weight: 600; color: #d2a8ff; margin-bottom: 2px; }
+  .corvid-name input { background: transparent; border: 1px solid transparent; border-radius: 4px; color: #d2a8ff; font-family: inherit; font-size: 1.1rem; font-weight: 600; padding: 1px 4px; width: 200px; }
+  .corvid-name input:hover { border-color: #30363d; }
+  .corvid-name input:focus { border-color: #6f42c1; outline: none; background: #0d1117; }
+  .corvid-species { font-size: 0.8rem; color: #8b949e; }
+  .corvid-stats { display: flex; gap: 16px; margin-top: 8px; flex-wrap: wrap; }
+  .stat { text-align: center; }
+  .stat .num { font-size: 1.3rem; font-weight: 600; color: #e6edf3; }
+  .stat .lbl { font-size: 0.65rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+
+  .corvid-section { padding: 0 16px 12px; }
+  .section-label { font-size: 0.7rem; text-transform: uppercase; color: #8b949e; letter-spacing: 1px; margin-bottom: 6px; }
+
+  .notes-input { width: 100%; background: #0d1117; border: 1px solid #21262d; border-radius: 6px; color: #c9d1d9; font-family: inherit; font-size: 0.8rem; padding: 6px 8px; resize: vertical; min-height: 32px; }
+  .notes-input:focus { border-color: #6f42c1; outline: none; }
+
+  .heatmap { display: grid; grid-template-columns: repeat(24, 1fr); gap: 2px; }
+  .hm-cell { height: 22px; border-radius: 2px; background: #21262d; position: relative; }
+  .hm-cell:hover::after { content: attr(data-tip); position: absolute; bottom: 26px; left: 50%; transform: translateX(-50%); background: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 2px 6px; font-size: 0.65rem; white-space: nowrap; color: #c9d1d9; z-index: 10; }
+  .hm-labels { display: grid; grid-template-columns: repeat(24, 1fr); gap: 2px; margin-top: 1px; }
+  .hm-label { font-size: 0.55rem; color: #484f58; text-align: center; }
+
+  .sightings-list { max-height: 300px; overflow-y: auto; }
+  .sighting-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 0.78rem; }
+  .sighting-row:last-child { border-bottom: none; }
+  .sighting-time { color: #8b949e; min-width: 140px; }
+  .sighting-conf { color: #3fb950; min-width: 40px; }
+  .sighting-link { color: #58a6ff; text-decoration: none; }
+  .sighting-link:hover { text-decoration: underline; }
+
+  .none { color: #8b949e; font-size: 0.85rem; padding: 24px 0; }
+
+  @media (max-width: 640px) {
+    .corvid-header { flex-direction: column; align-items: center; text-align: center; }
+    .corvid-stats { justify-content: center; }
+    .corvid-name input { text-align: center; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <a href="/" style="display:inline-block;padding:8px 14px;margin-bottom:8px;font-size:0.85rem;color:#58a6ff;background:#1f6feb11;border:1px solid #1f6feb;border-radius:8px;text-decoration:none">&#8592; mimir</a>
+  <h1>&#x1F426;&#x200D;&#x2B1B; Known Corvids</h1>
+
+  {% if crows %}
+  {% for c in crows %}
+  <div class="corvid-card">
+    <div class="corvid-header">
+      {% if c.photo %}
+      <img class="corvid-photo" src="/api/camera/photo/{{ c.photo }}" alt="{{ c.name }}">
+      {% else %}
+      <div class="corvid-photo-placeholder">&#x1F426;&#x200D;&#x2B1B;</div>
+      {% endif %}
+
+      <div class="corvid-info">
+        <div class="corvid-name">
+          <input value="{{ c.name }}" onchange="renameCrow({{ c.id }}, this.value)" title="Click to rename">
+        </div>
+        <div class="corvid-species">{{ c.species }} &middot; ID #{{ c.id }}</div>
+        <div class="corvid-stats">
+          <div class="stat"><div class="num">{{ c.sighting_count }}</div><div class="lbl">sightings</div></div>
+          <div class="stat"><div class="num">{{ c.days_active }}</div><div class="lbl">days seen</div></div>
+          <div class="stat"><div class="num">{{ c.avg_per_day }}</div><div class="lbl">avg/day</div></div>
+        </div>
+        <div style="font-size:0.75rem;color:#8b949e;margin-top:6px">
+          First: {{ c.first_seen_display }} &middot; Last: {{ c.last_seen_display }}
+        </div>
+      </div>
+    </div>
+    <div class="corvid-section">
+      <div class="section-label">Voice Signature</div>
+      <img src="/api/crow/voiceprint/{{ c.id }}" alt="voiceprint"
+           style="max-width:100%;border-radius:6px;">
+    </div>
+
+    <div class="corvid-section">
+      <div class="section-label">Notes</div>
+      <textarea class="notes-input" placeholder="Add notes about this corvid..."
+        onchange="updateNotes({{ c.id }}, this.value)">{{ c.notes or '' }}</textarea>
+    </div>
+
+    <div class="corvid-section">
+      <div class="section-label">Activity by Hour</div>
+      <div class="heatmap">
+        {% for h in c.hourly %}
+        <div class="hm-cell" data-tip="{{ h.label }}: {{ h.count }}"
+          style="background: rgba(111, 66, 193, {{ h.alpha }})"></div>
+        {% endfor %}
+      </div>
+      <div class="hm-labels">
+        {% for h in c.hourly %}
+        <div class="hm-label">{% if h.hour % 4 == 0 %}{{ h.label }}{% endif %}</div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="corvid-section">
+      <div class="section-label">All Sightings ({{ c.sightings|length }})</div>
+      <div class="sightings-list">
+        {% for s in c.sightings %}
+        <div class="sighting-row">
+          <span class="sighting-time">{{ s.display_time }}</span>
+          <span class="sighting-conf">{{ (s.confidence * 100)|int }}%</span>
+          <span style="color:#8b949e">{{ s.start_sec }}&#8211;{{ s.end_sec }}s</span>
+          <button onclick="playSegment(this,'{{ s.wav_path.lstrip('/') }}',{{ s.start_sec }},{{ s.end_sec }})"
+            style="background:#23863622;border:1px solid #238636;border-radius:4px;color:#3fb950;font-size:0.72rem;padding:2px 8px;cursor:pointer">&#9654; call</button>
+          <button onclick="playSegment(this,'{{ s.wav_path.lstrip('/') }}',0,0)"
+            style="background:#1f6feb11;border:1px solid #1f6feb;border-radius:4px;color:#58a6ff;font-size:0.72rem;padding:2px 8px;cursor:pointer">&#9654; full</button>
+          <audio class="sighting-audio" data-path="{{ s.wav_path.lstrip('/') }}" preload="none" style="display:none"></audio>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+  {% else %}
+  <div class="none">No corvids identified yet. When BirdNET detects corvids, their voice fingerprints will be recorded here.</div>
+  {% endif %}
+</div>
+<script>
+let activeAudio = null;
+function playSegment(btn, path, start, end) {
+  // Stop any currently playing audio
+  if (activeAudio && !activeAudio.paused) {
+    activeAudio.pause();
+    activeAudio.currentTime = 0;
+    if (activeAudio._btn) activeAudio._btn.textContent = '\u25B6 ' + activeAudio._btn.dataset.label;
+  }
+  const row = btn.closest('.sighting-row');
+  let audio = row.querySelector('.sighting-audio');
+  if (!audio.src || !audio.src.includes(path)) {
+    audio.src = '/audio/' + path;
+  }
+  const label = end > 0 ? 'call' : 'full';
+  btn.dataset.label = label;
+  if (end > 0) {
+    audio.currentTime = start;
+    audio.play();
+    btn.textContent = '\u23F8 call';
+    // Stop at end time
+    audio._stopAt = end;
+    audio.ontimeupdate = function() {
+      if (this.currentTime >= this._stopAt) {
+        this.pause();
+        btn.textContent = '\u25B6 call';
+      }
+    };
+  } else {
+    audio.currentTime = 0;
+    audio.play();
+    btn.textContent = '\u23F8 full';
+    audio.ontimeupdate = null;
+  }
+  audio._btn = btn;
+  activeAudio = audio;
+  audio.onended = function() { btn.textContent = '\u25B6 ' + label; };
+  audio.onpause = function() { if (!audio.ontimeupdate) btn.textContent = '\u25B6 ' + label; };
+}
+
+async function renameCrow(id, name) {
+  await fetch('/api/crow/rename', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id, name})
+  });
+}
+async function updateNotes(id, notes) {
+  await fetch('/api/crow/notes', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id, notes})
+  });
+}
+</script>
+</body>
+</html>
+"""
+
+
+
+@app.route("/api/crow/rename", methods=["POST"])
+@require_auth
+def api_crow_rename():
+    import sys
+    sys.path.insert(0, "/home/pi/mimir")
+    from crow_id import rename_crow
+    data = request.get_json(silent=True) or {}
+    crow_id = data.get("id")
+    name = data.get("name", "").strip()
+    if crow_id and name:
+        rename_crow(crow_id, name)
+        return jsonify({"ok": True})
+    return jsonify({"error": "missing id or name"}), 400
+
+
+@app.route("/api/crow/notes", methods=["POST"])
+@require_auth
+def api_crow_notes():
+    import sqlite3
+    data = request.get_json(silent=True) or {}
+    crow_id = data.get("id")
+    notes = data.get("notes", "")
+    if crow_id:
+        conn = sqlite3.connect("/mnt/usb/crow_id.db")
+        conn.execute("UPDATE crows SET notes = ? WHERE id = ?", (notes, crow_id))
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True})
+    return jsonify({"error": "missing id"}), 400
+
+
+@app.route("/api/crow/voiceprint/<int:crow_id>")
+@require_auth
+def api_crow_voiceprint(crow_id):
+    """Serve cached spectrogram PNG for this corvid."""
+    cached = Path("/mnt/usb/cache/spectrograms") / f"crow_{crow_id}.png"
+    if cached.exists():
+        return send_file(str(cached), mimetype="image/png")
+    abort(404)
+
+
+@app.route("/camera_feed")
+@require_auth
+def camera_feed():
+    """Camera clips page — motion and AI detections."""
+    camera_dir = Path("/mnt/usb/camera")
+    clips = []
+    for mp4 in sorted(camera_dir.rglob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)[:100]:
+        thumb = mp4.with_name(mp4.stem + "_thumb.jpg")
+        sidecar = mp4.with_suffix(".json")
+        meta = {}
+        if sidecar.exists():
+            try: meta = json.loads(sidecar.read_text())
+            except: pass
+        from datetime import datetime
+        mt = datetime.fromtimestamp(mp4.stat().st_mtime)
+        now = datetime.now()
+        if mt.date() == now.date():
+            day = "Today"
+        elif (now.date() - mt.date()).days == 1:
+            day = "Yesterday"
+        else:
+            day = mt.strftime("%a %b %-d")
+        vision = meta.get("vision_id", {})
+        clips.append({
+            "path": str(mp4),
+            "name": mp4.name,
+            "display_time": f"{day} {mt.strftime('%-I:%M %p')}",
+            "thumb": str(thumb) if thumb.exists() else None,
+            "label": meta.get("label", "motion"),
+            "confidence": meta.get("confidence", 0),
+            "size_kb": round(mp4.stat().st_size / 1024, 1),
+            "vision_species": vision.get("species", ""),
+            "vision_confidence": vision.get("confidence", ""),
+            "vision_desc": vision.get("description", ""),
+        })
+    return render_template_string(CAMERA_FEED_TEMPLATE, clips=clips)
+
+
+@app.route("/api/camera/snapshot")
+@require_auth
+def camera_snapshot():
+    """Grab a live JPEG from the RTSP stream."""
+    import subprocess
+    cfg = load_config()
+    rtsp_url = cfg.get("rtsp_url", "")
+    if not rtsp_url:
+        abort(503)
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    tmp.close()
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-rtsp_transport", "tcp",
+            "-i", rtsp_url,
+            "-frames:v", "1", "-q:v", "3", "-update", "1",
+            tmp.name,
+        ], timeout=10, capture_output=True)
+        if os.path.exists(tmp.name) and os.path.getsize(tmp.name) > 5000:
+            return send_file(tmp.name, mimetype="image/jpeg")
+    except Exception:
+        pass
+    abort(503)
 
 @app.route("/api/waveform/<path:filepath>")
 def waveform(filepath):
@@ -2228,6 +2974,19 @@ def delete_recording():
             # Remove sidecar if present
             sidecar = p.with_suffix(".json")
             if sidecar.exists():
+                # Clean up crow_id sightings linked to this wav
+                try:
+                    import sqlite3
+                    crow_db = Path("/mnt/usb/crow_id.db")
+                    if crow_db.exists():
+                        cdb = sqlite3.connect(str(crow_db))
+                        cdb.execute("DELETE FROM sightings WHERE wav_path = ?", (str(p),))
+                        # Remove any crows with zero sightings left
+                        cdb.execute("DELETE FROM crows WHERE id NOT IN (SELECT DISTINCT crow_id FROM sightings)")
+                        cdb.commit()
+                        cdb.close()
+                except Exception:
+                    pass
                 sidecar.unlink()
             # Remove empty day dirs
             try:
@@ -2423,6 +3182,26 @@ STATS_TEMPLATE = """
 {% endif %}
 
 </div>
+<script>
+async function deleteClip(btn, path) {
+  const card = btn.closest('.clip-card');
+  btn.disabled = true;
+  btn.textContent = '...';
+  const r = await fetch('/api/camera/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path})
+  });
+  if (r.ok) {
+    card.style.transition = 'opacity 0.3s';
+    card.style.opacity = '0';
+    setTimeout(() => card.remove(), 300);
+  } else {
+    btn.disabled = false;
+    btn.textContent = '\u2715';
+  }
+}
+</script>
 </body>
 </html>
 """

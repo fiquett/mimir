@@ -202,11 +202,13 @@ def classify_sounds(wav_path):
 
         tags = []
 
-        # ── Aircraft / helicopter ──
+        # ── Aircraft ──
         aircraft_energy = sub + bass * 0.6
         if aircraft_energy > 0.25:
-            if heli_am > 0.15:
-                conf = min(1.0, heli_am * 4 + aircraft_energy)
+            # Nearly all overhead noise is fixed-wing aircraft, not helicopters.
+            # Only tag as helicopter with very strong blade-slap AM modulation.
+            if heli_am > 0.30:
+                conf = min(1.0, heli_am * 3 + aircraft_energy)
                 tags.append({"label": "helicopter", "confidence": round(conf, 2)})
             else:
                 tags.append({"label": "aircraft", "confidence": round(aircraft_energy, 2)})
@@ -531,10 +533,52 @@ class Analyzer:
                         b["image_url"] = img["url"]
                         b["image_desc"] = img.get("desc", "")
 
-                # Link to camera clip captured at event start (by timestamp proximity)
-                camera_url = cfg.get("camera_url")
-                if camera_url and bird_detections:
-                    _link_camera_clip(camera_url, wav_path, bird_detections[0])
+                # Capture RTSP clip only for corvids
+                CORVIDS = {"american crow", "common raven", "northwestern crow",
+                           "fish crow", "steller's jay", "blue jay", "clark's nutcracker"}
+                rtsp_url = cfg.get("rtsp_url")
+                corvid_detections = [d for d in bird_detections if d["label"] in CORVIDS]
+                if rtsp_url and corvid_detections:
+                    bird_detections = corvid_detections  # use corvid as top for clip label
+                    try:
+                        from camera import capture_clip_async
+                        top = bird_detections[0]
+                        def _on_clip(mp4, thumb):
+                            if mp4:
+                                data = json.loads(sidecar.read_text()) if sidecar.exists() else result
+                                data["video"] = str(mp4)
+                                if thumb:
+                                    data["photo"] = str(thumb)
+                                sidecar.write_text(json.dumps(data, indent=2))
+                                print(f"[analysis] linked clip {mp4.name} → {wav_path.name}")
+                        capture_clip_async(
+                            label=top["label"],
+                            confidence=top["confidence"],
+                            duration=12,
+                            cfg=cfg,
+                            callback=_on_clip,
+                        )
+                    except Exception as e:
+                        print(f"[analysis] camera capture error: {e}")
+
+                # Individual crow voice fingerprinting
+                for det in corvid_detections:
+                    if det.get("start") is not None and det.get("end") is not None:
+                        try:
+                            from crow_id import identify_crow
+                            crow = identify_crow(
+                                wav_path, det["start"], det["end"],
+                                species=det["label"],
+                                confidence=det["confidence"],
+                            )
+                            if crow:
+                                det["crow_id"] = crow["crow_id"]
+                                det["crow_name"] = crow["crow_name"]
+                                det["is_new_crow"] = crow["is_new"]
+                                det["crow_sightings"] = crow["sighting_count"]
+                                det["crow_similarity"] = crow["similarity"]
+                        except Exception as e:
+                            print(f"[analysis] crow ID error: {e}")
 
         # Whisper transcription (if enabled in config)
         if cfg.get("whisper_enabled", False):
