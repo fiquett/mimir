@@ -57,6 +57,15 @@ CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 
 _capture_lock = threading.Lock()
 
+# Shared state for cross-detection verification
+# Updated by motion detector, read by audio-triggered captures
+_motion_state = {"last_motion": 0, "last_motion_pct": 0, "last_ai_animal": 0}
+
+
+def get_motion_state():
+    """Return current motion detector state."""
+    return dict(_motion_state)
+
 
 def identify_species_visual(thumb_path, cfg=None):
     """Send thumbnail to Claude vision API for species identification.
@@ -170,10 +179,7 @@ def capture_clip(label="bird", confidence=0.0, duration=12, cfg=None):
             "-rtsp_transport", "tcp",
             "-i", rtsp_url,
             "-t", str(duration),
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "26",
-            "-vf", "scale=1280:720",
+            "-c:v", "copy",  # source is H.264, no transcode needed (zero CPU)
             "-an",
             "-movflags", "+faststart",
             str(fpath),
@@ -182,33 +188,34 @@ def capture_clip(label="bird", confidence=0.0, duration=12, cfg=None):
         result = subprocess.run(cmd, timeout=duration + 15, capture_output=True)
 
         if fpath.exists() and fpath.stat().st_size > 10000:
-            # Extract thumbnail (full frame)
+            # Extract thumbnail from SUB stream (640x360, low CPU) instead of decoding 4K
             thumb_path = fpath.with_name(fpath.stem + "_thumb.jpg")
+            sub_url = rtsp_url.replace("_01_main", "_01_sub")
             subprocess.run([
-                "ffmpeg", "-y", "-i", str(fpath),
-                "-vframes", "1", "-q:v", "3", str(thumb_path),
-            ], timeout=10, capture_output=True)
+                "ffmpeg", "-y",
+                "-rtsp_transport", "tcp",
+                "-i", sub_url,
+                "-vframes", "1", "-q:v", "3", "-update", "1",
+                str(thumb_path),
+            ], timeout=8, capture_output=True)
 
-            # Extract cropped thumbnail of railing zone for better species ID
-            crop_path = fpath.with_name(fpath.stem + "_crop.jpg")
-            # Crop top-right area where birds land on railing
-            # For 3840x2160: crop 1920x1080 from top-right
-            # For other resolutions: crop right half, top half
-            subprocess.run([
-                "ffmpeg", "-y", "-i", str(fpath),
-                "-vframes", "1", "-q:v", "2",
-                "-vf", "crop=iw/2:ih/2:iw/2:0",
-                str(crop_path),
-            ], timeout=10, capture_output=True)
+            crop_path = fpath.with_name(fpath.stem + "_crop.jpg")  # placeholder, no longer generated
 
-            # Write sidecar
+            # Write sidecar with verification
+            now = time.time()
+            motion_age = now - _motion_state["last_motion"] if _motion_state["last_motion"] else 999
+            ai_age = now - _motion_state["last_ai_animal"] if _motion_state["last_ai_animal"] else 999
+            verified_visual = motion_age < 30 or ai_age < 60
             sidecar = fpath.with_suffix(".json")
             sidecar.write_text(json.dumps({
-                "ts": time.time(),
+                "ts": now,
                 "label": label,
                 "confidence": confidence,
                 "source": "rtsp",
                 "thumb": thumb_path.name if thumb_path.exists() else None,
+                "verified_visual": verified_visual,
+                "motion_age_s": round(motion_age, 1) if motion_age < 999 else None,
+                "ai_age_s": round(ai_age, 1) if ai_age < 999 else None,
             }, indent=2))
 
             print(f"[camera] captured {fname} ({fpath.stat().st_size // 1024}KB)")
@@ -280,9 +287,9 @@ class MotionDetector:
         self.running = False
         self._thread = None
         # Motion sensitivity: percentage of pixels that must change
-        self.min_area_pct = self.cfg.get("motion_min_area_pct", 0.5)
+        self.min_area_pct = self.cfg.get("motion_min_area_pct", 1.5)
         # Cooldown between motion captures (seconds)
-        self.cooldown = self.cfg.get("motion_cooldown", 30)
+        self.cooldown = self.cfg.get("motion_cooldown", 15)
         self._last_capture = 0
 
     def start(self):
@@ -337,6 +344,9 @@ class MotionDetector:
 
                     if changed_pct > self.min_area_pct:
                         now = time.time()
+                        # Always update shared motion state for audio verification
+                        _motion_state["last_motion"] = now
+                        _motion_state["last_motion_pct"] = changed_pct
                         if now - self._last_capture > self.cooldown:
                             self._last_capture = now
                             print(f"[camera] motion detected ({changed_pct:.1f}% changed)")
@@ -405,6 +415,7 @@ class ReolinkAlarmPoller:
                 now = time.time()
                 if dog_cat and now - self._last_alarm > self.cooldown:
                     self._last_alarm = now
+                    _motion_state["last_ai_animal"] = now
                     print("[camera] Reolink AI: animal detected!")
                     _send_ntfy("🐦 Animal on balcony", "Reolink camera detected an animal — check camera feed", self.cfg)
                     capture_clip_async(

@@ -523,8 +523,9 @@ class Analyzer:
                         "source": "birdnet",
                     })
                 result["tags"].sort(key=lambda t: t["confidence"], reverse=True)
-                # Push notification via ntfy.sh
-                _notify_birds(bird_detections, wav_path, cfg)
+                # Species ntfy notifications disabled — only crow_id sends ntfy
+                # (new corvid detected, auto-named)
+                # _notify_birds(bird_detections, wav_path, cfg)
 
                 # Fetch species images (Wikipedia, cached)
                 for b in bird_detections:

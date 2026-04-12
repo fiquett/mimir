@@ -1227,6 +1227,9 @@ async function checkNewRecordings() {
 
 // ── Analysis result polling ────────────────────────────────────
 async function pollAnalysis() {
+  // Skip entirely if no pending items
+  const pending = [...document.querySelectorAll('.rec-item .rec-tags')].filter(el => !el.querySelector('.tag'));
+  if (pending.length === 0) { setTimeout(pollAnalysis, 10000); return; }
   for (const item of document.querySelectorAll('.rec-item')) {
     const tagsEl = item.querySelector('.rec-tags');
     // Only poll items still awaiting results
@@ -1257,7 +1260,7 @@ async function pollAnalysis() {
       } catch(e) {}
     }
   }
-  setTimeout(pollAnalysis, 5000);
+  setTimeout(pollAnalysis, 10000);
 }
 pollAnalysis();
 
@@ -1292,7 +1295,7 @@ async function pollDisk() {
       det.addEventListener('toggle', () => { if(arrow) arrow.textContent = det.open ? '▼' : '▶'; }, {once:false});
     }
   } catch(e) {}
-  setTimeout(pollDisk, 10000);
+  setTimeout(pollDisk, 30000);
 }
 pollDisk();
 
@@ -1351,7 +1354,7 @@ async function pollState() {
       lastQueueBusy = false;
     }
   } catch(e) {}
-  setTimeout(pollState, 1000);
+  setTimeout(pollState, 2000);
 }
 pollState();
 
@@ -2416,6 +2419,13 @@ CAMERA_FEED_TEMPLATE = """
   <a class="back" href="/">&#8592; mimir</a>
   <h1>camera feed</h1>
   <div class="subtitle">Motion and AI detections from Reolink · <a href="/api/camera/snapshot" target="_blank" style="color:#58a6ff;text-decoration:none">Live snapshot</a></div>
+  <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px">
+    <a href="/camera_feed?filter=verified" style="padding:5px 12px;font-size:0.78rem;border-radius:14px;text-decoration:none;{% if cam_filter==\'verified\' %}background:#23863622;border:1px solid #238636;color:#3fb950{% else %}background:#21262d;border:1px solid #30363d;color:#8b949e{% endif %}">✓ Verified ({{ counts.verified }})</a>
+    <a href="/camera_feed?filter=ai" style="padding:5px 12px;font-size:0.78rem;border-radius:14px;text-decoration:none;{% if cam_filter==\'ai\' %}background:#1f6feb22;border:1px solid #1f6feb;color:#58a6ff{% else %}background:#21262d;border:1px solid #30363d;color:#8b949e{% endif %}">🤖 AI ({{ counts.ai }})</a>
+    <a href="/camera_feed?filter=audio" style="padding:5px 12px;font-size:0.78rem;border-radius:14px;text-decoration:none;{% if cam_filter==\'audio\' %}background:#6f42c122;border:1px solid #6f42c1;color:#d2a8ff{% else %}background:#21262d;border:1px solid #30363d;color:#8b949e{% endif %}">🔊 Audio ({{ counts.audio }})</a>
+    <a href="/camera_feed?filter=motion" style="padding:5px 12px;font-size:0.78rem;border-radius:14px;text-decoration:none;{% if cam_filter==\'motion\' %}background:#d2992222;border:1px solid #d29922;color:#d29922{% else %}background:#21262d;border:1px solid #30363d;color:#8b949e{% endif %}">◎ Motion ({{ counts.motion }})</a>
+    <a href="/camera_feed?filter=all" style="padding:5px 12px;font-size:0.78rem;border-radius:14px;text-decoration:none;{% if cam_filter==\'all\' %}background:#21262d;border:1px solid #58a6ff;color:#58a6ff{% else %}background:#21262d;border:1px solid #30363d;color:#8b949e{% endif %}">All ({{ counts.all }})</a>
+  </div>
 
   {% if clips %}
   <div class="clips-grid">
@@ -2532,7 +2542,7 @@ def delete_camera_clip():
 def crows_page():
     import sys
     sys.path.insert(0, "/home/pi/mimir")
-    from crow_id import get_all_crows, get_crow_sightings
+    from crow_id import get_all_crows, get_crow_sightings, get_crow_call_type_counts
     from datetime import datetime
     from collections import defaultdict
 
@@ -2542,6 +2552,7 @@ def crows_page():
 
     for c in crows:
         c["sightings"] = get_crow_sightings(c["id"], limit=100)
+        c["call_types"] = get_crow_call_type_counts(c["id"])
 
         # Format dates
         for field in ["first_seen", "last_seen"]:
@@ -2712,6 +2723,20 @@ CROWS_TEMPLATE = """
            style="max-width:100%;border-radius:6px;">
     </div>
 
+    {% if c.call_types %}
+    <div class="corvid-section">
+      <div class="section-label">Call Types</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        {% for ct, n in c.call_types.items() %}
+        <span style="font-size:0.78rem;background:#0d1f0d;border:1px solid #238636;border-radius:8px;padding:2px 9px;color:#3fb950">
+          {% if ct == \'caw\' %}🗣{% elif ct == \'rattle\' %}🥊{% elif ct == \'scold\' %}❗{% elif ct == \'coo\' %}💬{% elif ct == \'knock\' %}🥊{% else %}❓{% endif %}
+          {{ ct }} <strong>{{ n }}</strong>
+        </span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
     <div class="corvid-section">
       <div class="section-label">Notes</div>
       <textarea class="notes-input" placeholder="Add notes about this corvid..."
@@ -2741,6 +2766,7 @@ CROWS_TEMPLATE = """
           <span class="sighting-time">{{ s.display_time }}</span>
           <span class="sighting-conf">{{ (s.confidence * 100)|int }}%</span>
           <span style="color:#8b949e">{{ s.start_sec }}&#8211;{{ s.end_sec }}s</span>
+          {% if s.call_type %}<span style="color:#3fb950;font-size:0.7rem">{{ s.call_type }}</span>{% endif %}
           <button onclick="playSegment(this,'{{ s.wav_path.lstrip('/') }}',{{ s.start_sec }},{{ s.end_sec }})"
             style="background:#23863622;border:1px solid #238636;border-radius:4px;color:#3fb950;font-size:0.72rem;padding:2px 8px;cursor:pointer">&#9654; call</button>
           <button onclick="playSegment(this,'{{ s.wav_path.lstrip('/') }}',0,0)"
@@ -2862,15 +2888,38 @@ def api_crow_voiceprint(crow_id):
 @require_auth
 def camera_feed():
     """Camera clips page — motion and AI detections."""
+    cam_filter = request.args.get("filter", "verified")
     camera_dir = Path("/mnt/usb/camera")
     clips = []
-    for mp4 in sorted(camera_dir.rglob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)[:100]:
+    counts = {"all": 0, "verified": 0, "audio": 0, "motion": 0, "ai": 0}
+    for mp4 in sorted(camera_dir.rglob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)[:300]:
         thumb = mp4.with_name(mp4.stem + "_thumb.jpg")
         sidecar = mp4.with_suffix(".json")
         meta = {}
         if sidecar.exists():
             try: meta = json.loads(sidecar.read_text())
             except: pass
+        label = meta.get("label", "motion")
+        verified = meta.get("verified_visual", False)
+        is_motion = "motion" in label.lower()
+        is_ai = "camera_ai" in label.lower() or "(camera ai)" in label.lower()
+        is_audio = not is_motion and not is_ai
+
+        counts["all"] += 1
+        if verified or is_ai: counts["verified"] += 1
+        if is_audio: counts["audio"] += 1
+        if is_motion: counts["motion"] += 1
+        if is_ai: counts["ai"] += 1
+
+        if cam_filter == "verified" and not (verified or is_ai):
+            continue
+        if cam_filter == "audio" and not is_audio:
+            continue
+        if cam_filter == "motion" and not is_motion:
+            continue
+        if cam_filter == "ai" and not is_ai:
+            continue
+
         from datetime import datetime
         mt = datetime.fromtimestamp(mp4.stat().st_mtime)
         now = datetime.now()
@@ -2886,14 +2935,22 @@ def camera_feed():
             "name": mp4.name,
             "display_time": f"{day} {mt.strftime('%-I:%M %p')}",
             "thumb": str(thumb) if thumb.exists() else None,
-            "label": meta.get("label", "motion"),
+            "label": label,
             "confidence": meta.get("confidence", 0),
             "size_kb": round(mp4.stat().st_size / 1024, 1),
+            "verified_visual": verified,
+            "is_audio": is_audio,
+            "is_motion": is_motion,
+            "is_ai": is_ai,
+            "motion_age_s": meta.get("motion_age_s"),
             "vision_species": vision.get("species", ""),
             "vision_confidence": vision.get("confidence", ""),
             "vision_desc": vision.get("description", ""),
         })
-    return render_template_string(CAMERA_FEED_TEMPLATE, clips=clips)
+        if len(clips) >= 100:
+            break
+    return render_template_string(CAMERA_FEED_TEMPLATE,
+        clips=clips, cam_filter=cam_filter, counts=counts)
 
 
 @app.route("/api/camera/snapshot")

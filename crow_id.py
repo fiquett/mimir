@@ -17,8 +17,8 @@ from datetime import datetime
 DB_PATH = Path("/mnt/usb/crow_id.db")
 _db_lock = threading.Lock()
 
-# Similarity threshold: above this = same crow
-# Higher = stricter matching, fewer false merges but more fragmentation
+# Similarity threshold for MFCC embeddings (~250-dim hand-crafted features).
+# Higher = stricter matching, fewer false merges but more fragmentation.
 MATCH_THRESHOLD = 0.92
 # Minimum detections to consider a crow "established"
 MIN_SIGHTINGS = 3
@@ -106,10 +106,184 @@ def _init_db():
             end_sec REAL,
             embedding BLOB,
             confidence REAL,
+            call_type TEXT,
+            call_features TEXT,
             FOREIGN KEY (crow_id) REFERENCES crows(id)
         );
     """)
     conn.close()
+
+
+_birdnet_emb_interp = None
+_birdnet_lock = threading.Lock()
+BIRDNET_EMBEDDING_TENSOR_INDEX = 545  # GLOBAL_AVG_POOL/Mean — 1024-dim embedding before classifier
+BIRDNET_SAMPLE_RATE = 48000
+BIRDNET_SIG_LENGTH_SEC = 3.0
+
+
+def _get_birdnet_embedding_interpreter():
+    """Lazy-load a dedicated BirdNET interpreter with all tensors preserved.
+    Required because intermediate (embedding) tensors are wiped after invoke() by default."""
+    global _birdnet_emb_interp
+    with _birdnet_lock:
+        if _birdnet_emb_interp is None:
+            try:
+                from birdnetlib.analyzer import Analyzer as BNAnalyzer
+                from ai_edge_litert.interpreter import Interpreter
+
+                # Get model path from a temporary analyzer instance
+                tmp = BNAnalyzer()
+                model_path = tmp.model_path
+                print(f"[crow_id] loading BirdNET embedding interpreter from {model_path}")
+                interp = Interpreter(
+                    model_path=model_path,
+                    experimental_preserve_all_tensors=True,
+                )
+                interp.allocate_tensors()
+                _birdnet_emb_interp = interp
+                print("[crow_id] BirdNET embedding interpreter ready")
+            except Exception as e:
+                print(f"[crow_id] embedding interpreter load failed: {e}")
+                _birdnet_emb_interp = False
+    return _birdnet_emb_interp if _birdnet_emb_interp else None
+
+
+def _extract_birdnet_embedding(wav_path, start_sec=0, end_sec=None):
+    """Extract 1024-dim embedding from BirdNET's global average pool layer.
+    Returns 1D normalized numpy array, or None on failure."""
+    try:
+        import librosa
+        interp = _get_birdnet_embedding_interpreter()
+        if interp is None:
+            return None
+
+        duration = (end_sec - start_sec) if end_sec else BIRDNET_SIG_LENGTH_SEC
+        y, sr = librosa.load(str(wav_path), sr=BIRDNET_SAMPLE_RATE,
+                             offset=start_sec, duration=duration, mono=True)
+        if len(y) < BIRDNET_SAMPLE_RATE * 0.5:
+            return None
+        target_len = int(BIRDNET_SAMPLE_RATE * BIRDNET_SIG_LENGTH_SEC)
+        if len(y) < target_len:
+            y = np.pad(y, (0, target_len - len(y)))
+        else:
+            y = y[:target_len]
+
+        with _birdnet_lock:
+            input_idx = interp.get_input_details()[0]["index"]
+            data = np.array([y], dtype=np.float32)
+            interp.set_tensor(input_idx, data)
+            interp.invoke()
+            emb = interp.get_tensor(BIRDNET_EMBEDDING_TENSOR_INDEX)[0].copy()
+
+        # The embedding is shape (1, 1024) → flatten to (1024,)
+        emb = emb.flatten()
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        return emb.astype(np.float32)
+    except Exception as e:
+        print(f"[crow_id] BirdNET embedding error: {e}")
+        return None
+
+
+def classify_call_type(wav_path, start_sec=0, end_sec=None):
+    """Classify the type of crow call from acoustic features.
+    Returns dict with {type, confidence, features} or None.
+
+    Common crow call types:
+    - caw: classic repetitive harmonic call, 0.3-0.8s, 1-3kHz peak
+    - rattle: rapid broadband clicks, often repeated
+    - scold: harsh sharp repeated calls (alarm)
+    - coo: quiet low-pitched soft call
+    - knock: single percussive sound
+    - other: doesn't match known patterns
+    """
+    try:
+        import librosa
+        y, sr = librosa.load(str(wav_path), sr=22050,
+                             offset=start_sec,
+                             duration=(end_sec - start_sec) if end_sec else 3.0,
+                             mono=True)
+        if len(y) < sr * 0.2:
+            return None
+
+        duration = len(y) / sr
+
+        # Onset detection — count distinct call pulses
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        onsets = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr,
+                                              backtrack=False, units="time")
+        n_pulses = len(onsets)
+        pulse_rate = n_pulses / duration if duration > 0 else 0
+
+        # Pitch contour
+        f0 = librosa.yin(y, fmin=200, fmax=4000, sr=sr)
+        f0_voiced = f0[f0 > 0]
+        if len(f0_voiced) > 5:
+            f0_mean = float(np.mean(f0_voiced))
+            f0_std = float(np.std(f0_voiced))
+            f0_min = float(np.percentile(f0_voiced, 10))
+            f0_max = float(np.percentile(f0_voiced, 90))
+        else:
+            f0_mean = f0_std = f0_min = f0_max = 0
+
+        # Spectral features
+        spec_cent = float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr)))
+        spec_flat = float(np.mean(librosa.feature.spectral_flatness(y=y)))
+        zcr = float(np.mean(librosa.feature.zero_crossing_rate(y)))
+        rms = float(np.mean(librosa.feature.rms(y=y)))
+
+        # Harmonicity proxy via spectral flatness inverse (much faster than HPSS)
+        # Tonal/harmonic sounds have low spectral flatness
+        harm_ratio = float(1.0 - min(spec_flat * 3, 1.0))
+
+        features = {
+            "duration": round(duration, 2),
+            "n_pulses": n_pulses,
+            "pulse_rate": round(pulse_rate, 2),
+            "f0_mean": round(f0_mean, 1),
+            "f0_range": round(f0_max - f0_min, 1),
+            "spec_centroid": round(spec_cent, 1),
+            "spec_flatness": round(spec_flat, 3),
+            "zcr": round(zcr, 3),
+            "harm_ratio": round(harm_ratio, 3),
+            "rms": round(rms, 3),
+        }
+
+        # Tuned from real distribution stats on Pacific NW american crow calls
+        # via balcony mic. Pitch is primary discriminator.
+        call_type = "other"
+        conf = 0.5
+
+        # Rattle: very rapid pulses (>6/sec) — clicks/knocks repeated
+        if pulse_rate > 6 and n_pulses > 12:
+            call_type = "rattle"
+            conf = 0.75
+        # Scold: high pulse count + low pitch + many pulses (alarm "kaw kaw kaw")
+        elif n_pulses > 8 and f0_mean < 1200 and pulse_rate > 3:
+            call_type = "scold"
+            conf = 0.7
+        # Caw: classic call, mid-range pitch (700-2500 Hz), moderate pulses
+        elif 700 < f0_mean < 2500 and pulse_rate < 4 and n_pulses < 10:
+            call_type = "caw"
+            conf = 0.8
+        # Coo: quiet low-pitched soft call (rare for crows on balcony, common for jays)
+        elif rms < 0.012 and f0_mean > 0 and f0_mean < 800:
+            call_type = "coo"
+            conf = 0.7
+        # High pitched call (alarm/contact)
+        elif f0_mean > 2500:
+            call_type = "alarm"
+            conf = 0.65
+        # Low gronk
+        elif f0_mean > 0 and f0_mean < 500 and n_pulses <= 4:
+            call_type = "gronk"
+            conf = 0.6
+
+        return {"type": call_type, "confidence": conf, "features": features}
+    except Exception as e:
+        print(f"[crow_id] call type classification error: {e}")
+        return None
 
 
 def _extract_mfcc(wav_path, start_sec=0, end_sec=None, n_mfcc=26):
@@ -214,14 +388,20 @@ def _blob_to_embedding(blob):
     return np.frombuffer(blob, dtype=np.float32)
 
 
-def identify_crow(wav_path, start_sec, end_sec, species="american crow", confidence=0.0):
+def identify_crow(wav_path, start_sec, end_sec, species="american crow",
+                  confidence=0.0, timestamp=None):
     """
     Identify which individual crow made this call.
+    timestamp: ISO string for when the call occurred. Defaults to file mtime, then now.
     Returns {crow_id, crow_name, is_new, similarity, sighting_count} or None.
     """
     with _db_lock:
         _init_db()
 
+        # MFCC features capture individual acoustic detail better than BirdNET's
+        # 1024-dim embedding (which is optimized for species discrimination, not
+        # individual ID). Tested: same-species BirdNET sims range 0.55-0.85,
+        # too noisy for reliable individual matching.
         embedding = _extract_mfcc(wav_path, start_sec, end_sec)
         if embedding is None:
             return None
@@ -246,7 +426,14 @@ def identify_crow(wav_path, start_sec, end_sec, species="american crow", confide
                     best_sim = sim
                     best_match = crow
 
-        now = datetime.now().isoformat()
+        # Use provided timestamp, then file mtime, then now
+        if timestamp:
+            now = timestamp
+        else:
+            try:
+                now = datetime.fromtimestamp(Path(wav_path).stat().st_mtime).isoformat()
+            except Exception:
+                now = datetime.now().isoformat()
 
         if best_match and best_sim >= MATCH_THRESHOLD:
             # Known crow — update
@@ -305,12 +492,17 @@ def identify_crow(wav_path, start_sec, end_sec, species="american crow", confide
                       f"{crow_name} — {species}\nFirst time hearing this individual. Listening for a return visit to confirm and name them."),
                 daemon=True).start()
 
+        # Classify call type
+        call_info = classify_call_type(wav_path, start_sec, end_sec)
+        call_type = call_info["type"] if call_info else None
+        call_features = json.dumps(call_info["features"]) if call_info else None
+
         # Record sighting
         conn.execute(
-            "INSERT INTO sightings (crow_id, timestamp, wav_path, start_sec, end_sec, embedding, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sightings (crow_id, timestamp, wav_path, start_sec, end_sec, embedding, confidence, call_type, call_features) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (crow_id, now, str(wav_path), start_sec, end_sec,
-             _embedding_to_blob(embedding), confidence)
+             _embedding_to_blob(embedding), confidence, call_type, call_features)
         )
         conn.commit()
         conn.close()
@@ -318,6 +510,7 @@ def identify_crow(wav_path, start_sec, end_sec, species="american crow", confide
         result = {
             "crow_id": crow_id,
             "crow_name": crow_name,
+            "call_type": call_type,
             "is_new": is_new,
             "similarity": round(best_sim, 3),
             "sighting_count": count,
@@ -404,12 +597,25 @@ def get_crow_sightings(crow_id, limit=50):
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT timestamp, wav_path, start_sec, end_sec, confidence "
+        "SELECT timestamp, wav_path, start_sec, end_sec, confidence, call_type "
         "FROM sightings WHERE crow_id = ? ORDER BY timestamp DESC LIMIT ?",
         (crow_id, limit)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_crow_call_type_counts(crow_id):
+    """Return {call_type: count} for a specific crow."""
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        "SELECT call_type, COUNT(*) FROM sightings "
+        "WHERE crow_id = ? AND call_type IS NOT NULL "
+        "GROUP BY call_type ORDER BY 2 DESC",
+        (crow_id,)
+    ).fetchall()
+    conn.close()
+    return {row[0]: row[1] for row in rows}
 
 
 def rename_crow(crow_id, new_name):
